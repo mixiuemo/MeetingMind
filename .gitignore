@@ -1,0 +1,35 @@
+.env
+backend/.env
+
+# Frontend dependencies and builds
+node_modules/
+dist/
+
+# Python caches and tooling
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime output
+*.log
+*.pid
+backend/data/
+*.wav
+*.pcm
+
+# Local ASR/VAD model files
+backend/models/
+
+# Local editor and Codex caches
+.codex-doc-cache/
+.vscode/
+.idea/
+
+# OS metadata
+.DS_Store
+Thumbs.db
