@@ -29,7 +29,7 @@ button { border: 0; cursor: pointer; }
 .stage-light-two { width: 380px; height: 380px; bottom: -280px; left: 10%; background: rgb(53 213 198 / 10%); }
 
 .topbar {
-  position: relative; z-index: 20; max-width: 1360px; height: 88px; margin: auto; padding: 0 24px;
+  position: relative; z-index: 20; max-width: 1360px; height: 88px; margin: auto; padding: 0 120px 0 24px;
   display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
 }
 .brand { padding: 0; display: flex; align-items: center; gap: 11px; background: transparent; color: inherit; text-align: left; }
@@ -79,7 +79,7 @@ button { border: 0; cursor: pointer; }
 .status-dot, .listening-dot { width: 7px; height: 7px; border-radius: 50%; background: #6dff9c; box-shadow: 0 0 15px rgb(109 255 156 / 55%); animation: pulse 1.7s ease-in-out infinite; }
 @keyframes pulse { 50% { transform: scale(.65); opacity: .55; } }
 
-.workspace { position: relative; z-index: 1; max-width: 1360px; margin: auto; padding: 0 24px 60px; }
+.workspace { position: relative; z-index: 1; max-width: 1360px; margin: auto; padding: 0 120px 60px 24px; }
 .workspace > section { animation: view-enter .38s cubic-bezier(.22, 1, .36, 1); }
 @keyframes view-enter {
   from { transform: translateY(7px); opacity: 0; }
@@ -222,7 +222,7 @@ button { border: 0; cursor: pointer; }
 .speech-generator textarea { width: 100%; min-height: 230px; padding: 22px; resize: vertical; border: 1px solid rgb(139 165 255 / 14%); border-radius: 20px; outline: 0; background: radial-gradient(circle at 15% 0%, rgb(139 165 255 / 10%), transparent 40%), rgb(4 6 10 / 40%); box-shadow: inset 0 1px 0 rgb(255 255 255 / 7%); color: #dfe4ed; font-size: 14px; line-height: 1.9; }.speech-generator textarea::placeholder { color: #555f71; }
 .speech-generator-footer { margin-top: 13px; display: flex; align-items: center; justify-content: space-between; gap: 20px; }.speech-generator-footer span, .speech-status { color: #687386; font-size: 9px; }.speech-generator-footer button, .speech-toolbar button, .speech-toolbar a { padding: 9px 13px; border: 1px solid rgb(255 255 255 / 11%); border-radius: 999px; background: rgb(255 255 255 / 5%); color: #b8c3d8; font-size: 9px; font-weight: 700; text-decoration: none; }.speech-generator-footer button { background: linear-gradient(135deg, rgb(150 174 255 / 23%), rgb(255 255 255 / 7%)); color: #eef1f7; }.speech-generator-footer button:disabled, .speech-toolbar button:disabled { cursor: wait; opacity: .5; }
 .speech-toolbar { flex: 0 0 auto; padding: 18px 22px; display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid rgb(255 255 255 / 8%); }.speech-toolbar > div:first-child { display: grid; gap: 5px; }.speech-toolbar span { color: #687386; font-size: 9px; }.speech-toolbar > div:last-child { display: flex; gap: 7px; }.speech-toolbar .danger { color: #c27d86; }
-.speech-paper-wrap { min-height: 0; padding: 30px; flex: 1; overflow-y: auto; }.speech-paper { width: min(760px, 100%); min-height: 1050px; margin: 0 auto; padding: 72px 78px 90px; border: 1px solid rgb(255 255 255 / 8%); background: #f4f1e9; box-shadow: 0 30px 80px rgb(0 0 0 / 42%); color: #272522; }.speech-title-input, .speech-content-input { width: 100%; border: 0; outline: 0; background: transparent; color: inherit; }.speech-title-input { margin-bottom: 38px; font-family: "Microsoft YaHei UI", sans-serif; font-size: 25px; font-weight: 750; text-align: center; }.speech-content-input { min-height: 850px; resize: none; overflow: hidden; font-family: SimSun, "宋体", serif; font-size: 17px; line-height: 2; text-align: justify; white-space: pre-wrap; }.speech-status { padding: 8px 22px 13px; text-align: right; }
+.speech-paper-wrap { min-height: 0; padding: 30px; flex: 1; overflow-y: auto; }.speech-paper { width: min(760px, 100%); min-height: 1050px; margin: 0 auto; padding: 72px 78px 90px; border: 1px solid rgb(255 255 255 / 8%); background: #f4f1e9; box-shadow: 0 30px 80px rgb(0 0 0 / 42%); color: #272522; }.speech-title-input, .speech-content-input { width: 100%; border: 0; outline: 0; background: transparent; color: inherit; }.speech-title-input { margin-bottom: 38px; font-family: "Microsoft YaHei UI", sans-serif; font-size: 25px; font-weight: 750; text-align: center; }.speech-content-input { min-height: 850px; resize: none; overflow: hidden; font-family: SimSun, "宋体", serif; font-size: 17px; line-height: 2; text-align: justify; white-space: pre-wrap; transition: opacity .2s ease, filter .2s ease; }.speech-content-input:read-only { cursor: progress; filter: drop-shadow(0 0 8px rgb(87 117 255 / 12%)); }.speech-content-input::selection { background: rgb(120 148 255 / 34%); color: #171b28; }.speech-status { padding: 8px 22px 13px; text-align: right; }
 .archive-empty {
   min-height: calc(100vh - 125px);
   display: grid;

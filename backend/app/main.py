@@ -21,10 +21,12 @@ from app.config import env_bool, env_float
 from app.exports.word import build_meeting_docx
 from app.exports.speech_word import build_speech_docx
 from app.services.meeting_analysis import analyze_meeting, llm_enabled
+from app.services.chat_assistant import generate_chat_reply, generate_chat_reply_stream
 from app.services.speech_writer import (
     count_speech_characters,
     estimate_minutes,
     generate_speech,
+    revise_speech,
 )
 from app.storage.audio import MeetingAudioWriter
 from app.storage.mongo import MeetingRepository
@@ -66,10 +68,18 @@ engine_error: str | None = None
 repository: MeetingRepository | None = None
 storage_error: str | None = None
 analysis_tasks: set[asyncio.Task] = set()
+STREAM_END = object()
 
 
 def is_transient_executor_shutdown(error: Exception) -> bool:
     return isinstance(error, RuntimeError) and "Executor shutdown has been called" in str(error)
+
+
+def next_stream_event(iterator):
+    try:
+        return next(iterator)
+    except StopIteration:
+        return STREAM_END
 
 
 @app.on_event("startup")
@@ -539,6 +549,56 @@ class SpeechUpdate(BaseModel):
     content: str
 
 
+class SpeechRevisionRequest(BaseModel):
+    instruction: str
+    session_id: str | None = None
+
+
+class ChatSessionCreateRequest(BaseModel):
+    mode: str
+    target_id: str | None = None
+    title: str | None = None
+
+
+class ChatMessageRequest(BaseModel):
+    content: str
+
+
+def normalize_chat_mode(mode: str) -> str:
+    clean_mode = mode.strip().lower()
+    if clean_mode not in {"free", "meeting", "speech"}:
+        raise HTTPException(status_code=400, detail="不支持的助手模式")
+    return clean_mode
+
+
+async def load_chat_target(mode: str, target_id: str | None) -> tuple[dict | None, dict | None]:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    if mode == "meeting":
+        if not target_id:
+            raise HTTPException(status_code=400, detail="会议助手需要 target_id")
+        meeting = await asyncio.to_thread(repository.get_meeting, target_id)
+        if meeting is None:
+            raise HTTPException(status_code=404, detail="会议不存在")
+        return meeting, None
+    if mode == "speech":
+        if not target_id:
+            raise HTTPException(status_code=400, detail="演讲稿助手需要 target_id")
+        speech = await asyncio.to_thread(repository.get_speech, target_id)
+        if speech is None:
+            raise HTTPException(status_code=404, detail="演讲稿不存在")
+        return None, speech
+    return None, None
+
+
+def default_chat_title(mode: str, meeting: dict | None, speech: dict | None) -> str:
+    if mode == "meeting":
+        return f"会议助手：{meeting.get('title') or '未命名会议'}"
+    if mode == "speech":
+        return f"演讲稿助手：{speech.get('title') or '未命名演讲稿'}"
+    return "自由聊天"
+
+
 @app.get("/api/meetings")
 async def list_meetings() -> list[dict]:
     if repository is None:
@@ -702,6 +762,161 @@ async def list_speeches() -> list[dict]:
     return await asyncio.to_thread(repository.list_speeches)
 
 
+@app.get("/api/chat/sessions")
+async def list_chat_sessions(mode: str | None = None, target_id: str | None = None) -> list[dict]:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    normalized_mode = normalize_chat_mode(mode) if mode else None
+    return await asyncio.to_thread(repository.list_chat_sessions, normalized_mode, target_id)
+
+
+@app.post("/api/chat/sessions")
+async def create_chat_session(request: ChatSessionCreateRequest) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    mode = normalize_chat_mode(request.mode)
+    meeting, speech = await load_chat_target(mode, request.target_id)
+    title = (request.title or "").strip() or default_chat_title(mode, meeting, speech)
+    return await asyncio.to_thread(
+        repository.create_chat_session,
+        str(uuid4()),
+        mode,
+        request.target_id,
+        title[:120],
+    )
+
+
+@app.get("/api/chat/sessions/{session_id}")
+async def get_chat_session(session_id: str) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    session = await asyncio.to_thread(repository.get_chat_session, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="助手会话不存在")
+    return session
+
+
+@app.post("/api/chat/sessions/{session_id}/messages")
+async def send_chat_message(session_id: str, request: ChatMessageRequest) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    session = await asyncio.to_thread(repository.get_chat_session, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="助手会话不存在")
+    meeting, speech = await load_chat_target(session["mode"], session.get("target_id"))
+    try:
+        result = await asyncio.to_thread(
+            generate_chat_reply,
+            session["mode"],
+            request.content,
+            summary=session.get("summary"),
+            messages=session.get("messages", []),
+            meeting=meeting,
+            speech=speech,
+        )
+    except RuntimeError as error:
+        if is_transient_executor_shutdown(error):
+            raise HTTPException(status_code=503, detail="服务正在重启，请稍后重试") from error
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+    now = utc_now()
+    persisted_messages = []
+    for message in result["messages"]:
+        persisted_messages.append(
+            {
+                **message,
+                "created_at": now,
+            }
+        )
+    updated = await asyncio.to_thread(
+        repository.update_chat_session,
+        session_id,
+        summary=result["summary"],
+        messages=persisted_messages,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="助手会话不存在")
+    return {
+        "session": updated,
+        "message": updated["messages"][-1] if updated["messages"] else None,
+    }
+
+
+@app.post("/api/chat/sessions/{session_id}/messages/stream")
+async def send_chat_message_stream(session_id: str, request: ChatMessageRequest):
+    """流式聊天消息端点"""
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+
+    session = await asyncio.to_thread(repository.get_chat_session, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="助手会话不存在")
+
+    meeting, speech = await load_chat_target(session["mode"], session.get("target_id"))
+
+    async def event_generator():
+        try:
+            result_data = None
+            iterator = generate_chat_reply_stream(
+                session["mode"],
+                request.content,
+                summary=session.get("summary"),
+                messages=session.get("messages", []),
+                meeting=meeting,
+                speech=speech,
+            )
+            while True:
+                event = await asyncio.to_thread(next_stream_event, iterator)
+                if event is STREAM_END:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+                if event.get("type") == "done":
+                    result_data = event
+
+            if result_data:
+                now = utc_now()
+                persisted_messages = []
+                for message in result_data["messages"]:
+                    persisted_messages.append({**message, "created_at": now})
+
+                await asyncio.to_thread(
+                    repository.update_chat_session,
+                    session_id,
+                    summary=result_data["summary"],
+                    messages=persisted_messages,
+                )
+        except Exception as error:
+            error_event = {
+                "type": "error",
+                "error": str(error),
+            }
+            yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Content-Encoding": "identity",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.delete("/api/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    deleted = await asyncio.to_thread(repository.delete_chat_session, session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="助手会话不存在")
+    return {"status": "ok"}
+
+
 @app.post("/api/speeches")
 async def create_speech(request: SpeechGenerateRequest) -> dict:
     if repository is None:
@@ -755,6 +970,72 @@ async def update_speech(speech_id: str, update: SpeechUpdate) -> dict:
     if speech is None:
         raise HTTPException(status_code=404, detail="演讲稿不存在")
     return speech
+
+
+@app.post("/api/speeches/{speech_id}/revise")
+async def revise_selected_speech(speech_id: str, request: SpeechRevisionRequest) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    speech = await asyncio.to_thread(repository.get_speech, speech_id)
+    if speech is None:
+        raise HTTPException(status_code=404, detail="演讲稿不存在")
+    try:
+        revised = await asyncio.to_thread(revise_speech, speech, request.instruction)
+    except RuntimeError as error:
+        if is_transient_executor_shutdown(error):
+            raise HTTPException(status_code=503, detail="服务正在重启，请稍后重试") from error
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    updated = await asyncio.to_thread(
+        repository.update_speech,
+        speech_id,
+        revised["title"],
+        revised["content"],
+        {
+            "word_count": revised["word_count"],
+            "estimated_minutes": revised["estimated_minutes"],
+        },
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="演讲稿不存在")
+    updated_session = None
+    if request.session_id:
+        session = await asyncio.to_thread(repository.get_chat_session, request.session_id)
+        if (
+            session is None
+            or session.get("mode") != "speech"
+            or session.get("target_id") != speech_id
+        ):
+            raise HTTPException(status_code=400, detail="演讲稿助手会话与当前演讲稿不匹配")
+        now = utc_now()
+        messages = [
+            *session.get("messages", []),
+            {
+                "id": str(uuid4()),
+                "role": "user",
+                "content": request.instruction.strip(),
+                "created_at": now,
+            },
+            {
+                "id": str(uuid4()),
+                "role": "assistant",
+                "content": revised["message"],
+                "created_at": now,
+            },
+        ]
+        updated_session = await asyncio.to_thread(
+            repository.update_chat_session,
+            request.session_id,
+            summary=session.get("summary"),
+            messages=messages,
+        )
+    return {
+        "speech": updated,
+        "message": revised["message"],
+        "revision": revised["revision"],
+        "session": updated_session,
+    }
 
 
 @app.post("/api/speeches/{speech_id}/regenerate")

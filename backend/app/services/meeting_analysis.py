@@ -37,6 +37,7 @@ def _chat(
     *,
     temperature: float = 0.1,
     max_tokens: int | None = None,
+    response_format: dict | None = {"type": "json_object"},
 ) -> str:
     base_url = os.getenv("HUIYI_LLM_BASE_URL", "http://127.0.0.1:11434/v1").rstrip("/")
     body = {
@@ -45,10 +46,13 @@ def _chat(
         "temperature": temperature,
         "stream": False,
         "keep_alive": -1,
-        "think": False,
+        "enable_thinking": False,
         "max_tokens": max_tokens or env_int("HUIYI_LLM_MAX_TOKENS", 1600),
-        "response_format": {"type": "json_object"},
     }
+    if response_format is None:
+        body.pop("response_format", None)
+    else:
+        body["response_format"] = response_format
     reasoning_effort = os.getenv("HUIYI_LLM_REASONING_EFFORT", "").strip()
     if reasoning_effort:
         body["reasoning_effort"] = reasoning_effort

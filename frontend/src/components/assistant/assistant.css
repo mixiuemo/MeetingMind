@@ -1,0 +1,91 @@
+.assistant-launcher { position: fixed; right: auto; bottom: auto; z-index: 120; display: grid; place-items: center; border: 1px solid rgb(255 255 255 / 12%); border-radius: 50%; background: radial-gradient(circle at 30% 20%, rgb(135 182 255 / 26%), transparent 42%), linear-gradient(145deg, rgb(255 255 255 / 9%), rgb(255 255 255 / 4%)); box-shadow: 0 20px 60px rgb(0 0 0 / 28%), inset 0 1px 0 rgb(255 255 255 / 14%); color: #eef3ff; backdrop-filter: blur(26px); transition: transform .24s ease, border-color .24s ease, box-shadow .24s ease; }
+.assistant-launcher.open { opacity: 0; pointer-events: none; transform: translateY(-6px) scale(.92); }
+.assistant-launcher:hover { border-color: rgb(144 174 255 / 34%); box-shadow: 0 24px 65px rgb(0 0 0 / 34%), 0 0 30px rgb(105 137 255 / 16%), inset 0 1px 0 rgb(255 255 255 / 16%); }
+.assistant-launcher-ring { position: absolute; inset: 8px; border: 1px solid rgb(140 188 255 / 22%); border-radius: inherit; }
+.assistant-launcher-core { position: relative; font-size: 17px; font-weight: 800; letter-spacing: .08em; }
+.assistant-panel { position: fixed; right: auto; bottom: auto; z-index: 119; display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgb(255 255 255 / 10%); border-radius: 28px; background: linear-gradient(180deg, rgb(8 10 16 / 96%), rgb(12 14 22 / 98%)); box-shadow: 0 32px 90px rgb(0 0 0 / 42%), inset 0 1px 0 rgb(255 255 255 / 9%); backdrop-filter: blur(28px); opacity: 0; pointer-events: none; transform: translateY(-18px) scale(.98); transform-origin: bottom right; transition: opacity .24s ease, transform .24s ease; }
+.assistant-panel.open { opacity: 1; pointer-events: auto; transform: translateY(0) scale(1); }
+.assistant-header { padding: 18px 18px 14px; display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid rgb(255 255 255 / 7%); }
+.assistant-header h3 { margin: 6px 0 4px; color: #edf1f7; font-size: 18px; letter-spacing: -.03em; }
+.assistant-header span { color: #6e7a8e; font-size: 10px; }
+.assistant-header-actions { display: flex; gap: 8px; align-items: start; }
+.assistant-header-actions button { padding: 8px 10px; border: 1px solid rgb(255 255 255 / 10%); border-radius: 999px; background: rgb(255 255 255 / 5%); color: #b4bfd3; font-size: 9px; font-weight: 700; }
+.assistant-close { width: 36px; padding: 0 !important; font-size: 20px !important; line-height: 1; }
+.assistant-messages { flex: 1; min-height: 0; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; align-content: flex-start; }
+.assistant-message { display: flex; }
+.assistant-message.user { justify-content: flex-end; }
+.assistant-message.assistant { justify-content: flex-start; }
+.assistant-message-bubble { max-width: 86%; padding: 12px 14px; border-radius: 18px; background: rgb(255 255 255 / 5%); color: #dce2ec; box-shadow: inset 0 1px 0 rgb(255 255 255 / 7%); }
+.assistant-message.user .assistant-message-bubble { background: linear-gradient(145deg, rgb(139 165 255 / 26%), rgb(255 255 255 / 10%)); color: #f1f4fb; }
+.assistant-message-bubble p { margin: 0; white-space: pre-wrap; font-size: 13px; line-height: 1.75; }
+.assistant-message-bubble small { display: block; margin-top: 7px; color: #78849a; font-size: 9px; }
+.assistant-empty, .assistant-error { margin: auto 16px; padding: 18px; border: 1px solid rgb(255 255 255 / 8%); border-radius: 18px; background: rgb(255 255 255 / 4%); text-align: center; }
+.assistant-empty strong, .assistant-error strong { color: #edf0f7; font-size: 14px; }
+.assistant-empty p, .assistant-error p { margin: 9px 0 0; color: #737e91; font-size: 11px; line-height: 1.75; }
+.assistant-thinking { display: inline-flex; gap: 6px; padding: 8px 12px; border-radius: 999px; background: rgb(255 255 255 / 5%); width: fit-content; }
+.assistant-thinking span { width: 7px; height: 7px; border-radius: 50%; background: #8da7ff; animation: assistant-pulse 1.2s ease-in-out infinite; }
+.assistant-thinking span:nth-child(2) { animation-delay: .12s; }
+.assistant-thinking span:nth-child(3) { animation-delay: .24s; }
+.assistant-quick-actions { padding: 0 16px 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+.assistant-quick-actions button { padding: 8px 11px; border: 1px solid rgb(255 255 255 / 9%); border-radius: 999px; background: rgb(255 255 255 / 4%); color: #aeb8ca; font-size: 10px; }
+.assistant-composer { padding: 0 16px 16px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: end; }
+.assistant-composer textarea { width: 100%; min-height: 72px; padding: 12px 14px; resize: none; border: 1px solid rgb(255 255 255 / 9%); border-radius: 18px; outline: 0; background: rgb(255 255 255 / 4%); color: #edf2f8; font-size: 13px; line-height: 1.7; }
+.assistant-composer textarea::placeholder { color: #627084; }
+.assistant-composer button { padding: 11px 14px; border: 1px solid rgb(255 255 255 / 10%); border-radius: 14px; background: linear-gradient(145deg, rgb(145 170 255 / 24%), rgb(255 255 255 / 8%)); color: #f1f3fa; font-size: 11px; font-weight: 700; }
+.assistant-composer button:disabled, .assistant-quick-actions button:disabled { opacity: .45; cursor: wait; }
+.bind-required { margin-top: 18px; }
+
+.assistant-message.streaming .cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1.15em;
+  margin-left: 4px;
+  border-radius: 999px;
+  background: #9bb2ff;
+  vertical-align: -.18em;
+  box-shadow: 0 0 10px rgb(126 157 255 / 72%);
+  animation: cursor-blink .85s step-end infinite !important;
+  animation-duration: .85s !important;
+}
+
+.assistant-stream-waiting {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 152px;
+  color: #aebbd1;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.assistant-stream-waiting i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #91aaff;
+  box-shadow: 0 0 8px rgb(126 157 255 / 65%);
+  animation: assistant-pulse 1.15s ease-in-out infinite !important;
+  animation-duration: 1.15s !important;
+}
+
+.assistant-stream-waiting i:nth-child(2) {
+  animation-delay: .14s !important;
+}
+
+.assistant-stream-waiting i:nth-child(3) {
+  animation-delay: .28s !important;
+}
+
+.assistant-stream-waiting i:nth-child(4) {
+  animation-delay: .42s !important;
+}
+
+@keyframes cursor-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+@keyframes assistant-pulse {
+  0%, 80%, 100% { transform: scale(.82); opacity: .55; }
+  40% { transform: scale(1); opacity: 1; }
+}

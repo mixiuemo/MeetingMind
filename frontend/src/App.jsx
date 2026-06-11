@@ -1,5 +1,8 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { calculateLevel, prepareAudioChunk } from "./audio";
+import AssistantLauncher from "./components/assistant/AssistantLauncher";
+import AssistantPanel from "./components/assistant/AssistantPanel";
+import { buildAssistantContext } from "./utils/assistantContext";
 
 const SOCKET_URL = "ws://localhost:8000/ws/meetings/live";
 const API_URL = "http://localhost:8000";
@@ -260,6 +263,7 @@ function App() {
   const [speechPrompt, setSpeechPrompt] = useState("");
   const [speechBusy, setSpeechBusy] = useState(false);
   const [speechNotice, setSpeechNotice] = useState("描述你需要的演讲稿，AI 会自动理解并撰写完整正文。");
+  const [assistantOpen, setAssistantOpen] = useState(false);
 
   const socketRef = useRef(null);
   const streamRef = useRef(null);
@@ -485,6 +489,54 @@ function App() {
     } catch (error) {
       setSpeechNotice(error.message || "保存演讲稿失败");
       return false;
+    } finally {
+      setSpeechBusy(false);
+    }
+  }
+
+  async function animateSpeechRevision(speech, revision) {
+    const originalContent = selectedSpeech?.content || "";
+    const finalContent = speech.content || "";
+    const start = Math.max(0, Math.min(Number(revision?.start) || 0, originalContent.length));
+    const end = Math.max(start, Math.min(Number(revision?.end) || originalContent.length, originalContent.length));
+    const replacement = String(revision?.replacement ?? finalContent);
+    const prefix = originalContent.slice(0, start);
+    const suffix = originalContent.slice(end);
+    const batchSize = Math.max(2, Math.ceil(replacement.length / 80));
+
+    setSpeechBusy(true);
+    try {
+      setSpeechNotice("AI 正在定位并修改文稿...");
+      setSelectedSpeech((current) => ({
+        ...speech,
+        content: current?.content || originalContent,
+      }));
+
+      await wait(80);
+      const textarea = speechContentRef.current;
+      if (textarea) {
+        textarea.focus();
+        textarea.setSelectionRange(start, end);
+        const lineHeight = Number.parseFloat(window.getComputedStyle(textarea).lineHeight) || 34;
+        const linesBefore = originalContent.slice(0, start).split("\n").length;
+        textarea.closest(".speech-paper-wrap")?.scrollTo({
+          top: Math.max(0, linesBefore * lineHeight - 180),
+          behavior: "smooth",
+        });
+      }
+      await wait(420);
+
+      for (let index = 0; index < replacement.length; index += batchSize) {
+        const written = replacement.slice(0, index + batchSize);
+        const animatedContent = `${prefix}${written}${suffix}`;
+        setSelectedSpeech((current) => ({ ...current, ...speech, content: animatedContent }));
+        setSpeechNotice(`AI 正在修改文稿 · ${Math.min(100, Math.round((written.length / Math.max(1, replacement.length)) * 100))}%`);
+        await wait(38);
+      }
+
+      setSelectedSpeech(speech);
+      setSpeechNotice("AI 助手已修改并保存演讲稿。");
+      await loadSpeeches();
     } finally {
       setSpeechBusy(false);
     }
@@ -1029,6 +1081,7 @@ function App() {
 
   const canStart = status === "idle" || status === "ended";
   const isActive = status === "recording" || status === "paused" || status === "ending";
+  const assistantContext = buildAssistantContext(view, selectedMeeting, selectedSpeech);
 
   function renderDevicePicker() {
     return (
@@ -1469,6 +1522,7 @@ function App() {
                         ref={speechContentRef}
                         className="speech-content-input"
                         value={selectedSpeech.content}
+                        readOnly={speechBusy}
                         onChange={(event) => setSelectedSpeech((current) => ({ ...current, content: event.target.value }))}
                       />
                     </article>
@@ -1499,6 +1553,18 @@ function App() {
           </section>
         </div>
       )}
+
+      <AssistantPanel
+        open={assistantOpen}
+        context={assistantContext}
+        onClose={() => setAssistantOpen(false)}
+        onSpeechUpdated={animateSpeechRevision}
+      />
+      <AssistantLauncher
+        open={assistantOpen}
+        title={`打开 ${assistantContext.title}`}
+        onToggle={() => setAssistantOpen((current) => !current)}
+      />
     </div>
   );
 }
