@@ -23,10 +23,14 @@ class MeetingRepository:
         database = self.client[database_name]
         self.meetings = database["meetings"]
         self.segments = database["transcript_segments"]
+        self.speaker_profiles = database["speaker_profiles"]
+        self.speeches = database["speeches"]
         self.meetings.create_index([("started_at", DESCENDING)])
         self.segments.create_index(
             [("meeting_id", ASCENDING), ("sequence", ASCENDING)], unique=True
         )
+        self.speaker_profiles.create_index([("name", ASCENDING)])
+        self.speeches.create_index([("updated_at", DESCENDING)])
 
     def create_meeting(self, meeting_id: str, title: str, audio_path: str) -> None:
         now = utc_now()
@@ -78,6 +82,105 @@ class MeetingRepository:
             {"$set": {"edited_text": edited_text, "updated_at": utc_now()}},
         )
         return result.matched_count == 1
+
+    def create_speaker_profile(
+        self, profile_id: str, name: str, embedding: list[float], sample: dict
+    ) -> dict:
+        now = utc_now()
+        self.speaker_profiles.insert_one(
+            {
+                "_id": profile_id,
+                "name": name,
+                "centroid": embedding,
+                "embeddings": [embedding],
+                "samples": [sample],
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        return self.get_speaker_profile(profile_id)
+
+    def add_speaker_sample(
+        self,
+        profile_id: str,
+        embedding: list[float],
+        centroid: list[float],
+        sample: dict,
+    ) -> dict | None:
+        result = self.speaker_profiles.update_one(
+            {"_id": profile_id},
+            {
+                "$push": {"embeddings": embedding, "samples": sample},
+                "$set": {"centroid": centroid, "updated_at": utc_now()},
+            },
+        )
+        return self.get_speaker_profile(profile_id) if result.matched_count else None
+
+    def list_speaker_profiles(self, include_embeddings: bool = False) -> list[dict]:
+        return [
+            self._serialize_speaker_profile(profile, include_embeddings)
+            for profile in self.speaker_profiles.find().sort("updated_at", DESCENDING)
+        ]
+
+    def get_speaker_profile(
+        self, profile_id: str, include_embeddings: bool = False
+    ) -> dict | None:
+        profile = self.speaker_profiles.find_one({"_id": profile_id})
+        return (
+            self._serialize_speaker_profile(profile, include_embeddings)
+            if profile is not None
+            else None
+        )
+
+    def delete_speaker_profile(self, profile_id: str) -> bool:
+        return self.speaker_profiles.delete_one({"_id": profile_id}).deleted_count == 1
+
+    def create_speech(self, speech_id: str, prompt: str, generated: dict) -> dict:
+        now = utc_now()
+        self.speeches.insert_one(
+            {
+                "_id": speech_id,
+                "prompt": prompt,
+                **generated,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        return self.get_speech(speech_id)
+
+    def list_speeches(self) -> list[dict]:
+        return [
+            self._serialize_speech(speech)
+            for speech in self.speeches.find().sort("updated_at", DESCENDING)
+        ]
+
+    def get_speech(self, speech_id: str) -> dict | None:
+        speech = self.speeches.find_one({"_id": speech_id})
+        return self._serialize_speech(speech) if speech is not None else None
+
+    def update_speech(self, speech_id: str, title: str, content: str, stats: dict) -> dict | None:
+        result = self.speeches.update_one(
+            {"_id": speech_id},
+            {
+                "$set": {
+                    "title": title,
+                    "content": content,
+                    **stats,
+                    "updated_at": utc_now(),
+                }
+            },
+        )
+        return self.get_speech(speech_id) if result.matched_count else None
+
+    def regenerate_speech(self, speech_id: str, generated: dict) -> dict | None:
+        result = self.speeches.update_one(
+            {"_id": speech_id},
+            {"$set": {**generated, "updated_at": utc_now()}},
+        )
+        return self.get_speech(speech_id) if result.matched_count else None
+
+    def delete_speech(self, speech_id: str) -> bool:
+        return self.speeches.delete_one({"_id": speech_id}).deleted_count == 1
 
     def start_analysis(self, meeting_id: str) -> None:
         self.meetings.update_one(
@@ -160,8 +263,53 @@ class MeetingRepository:
             "meeting_id": segment["meeting_id"],
             "sequence": segment["sequence"],
             "speaker": segment["speaker"],
+            "speaker_id": segment.get("speaker_id", ""),
+            "speaker_confidence": segment.get("speaker_confidence", 0),
+            "speaker_status": segment.get("speaker_status", "disabled"),
+            "speaker_profile_id": segment.get("speaker_profile_id", ""),
             "original_text": segment["original_text"],
             "text": segment.get("edited_text") or segment["text"],
             "start_ms": segment["start_ms"],
             "end_ms": segment["end_ms"],
+        }
+
+    @staticmethod
+    def _serialize_speaker_profile(
+        profile: dict, include_embeddings: bool = False
+    ) -> dict:
+        samples = [
+            {
+                "id": sample["id"],
+                "duration_ms": sample["duration_ms"],
+                "created_at": utc_isoformat(sample["created_at"]),
+                "audio_url": (
+                    f"/api/speakers/{profile['_id']}/samples/{sample['id']}/audio"
+                ),
+            }
+            for sample in profile.get("samples", [])
+        ]
+        result = {
+            "id": profile["_id"],
+            "name": profile["name"],
+            "sample_count": len(samples),
+            "samples": samples,
+            "created_at": utc_isoformat(profile["created_at"]),
+            "updated_at": utc_isoformat(profile["updated_at"]),
+        }
+        if include_embeddings:
+            result["centroid"] = profile.get("centroid", [])
+            result["embeddings"] = profile.get("embeddings", [])
+        return result
+
+    @staticmethod
+    def _serialize_speech(speech: dict) -> dict:
+        return {
+            "id": speech["_id"],
+            "prompt": speech.get("prompt", ""),
+            "title": speech.get("title", "未命名演讲稿"),
+            "content": speech.get("content", ""),
+            "word_count": speech.get("word_count", 0),
+            "estimated_minutes": speech.get("estimated_minutes", 0),
+            "created_at": utc_isoformat(speech["created_at"]),
+            "updated_at": utc_isoformat(speech["updated_at"]),
         }

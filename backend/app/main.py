@@ -9,17 +9,31 @@ from urllib.parse import quote
 from uuid import uuid4
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.engines.funasr_nano import FunASRNanoEngine
+from app.engines.speaker import MeetingSpeakerTracker, SpeakerEmbeddingEngine
 from app.engines.silero_vad import SileroVadFactory
+from app.config import env_bool, env_float
 from app.exports.word import build_meeting_docx
+from app.exports.speech_word import build_speech_docx
 from app.services.meeting_analysis import analyze_meeting, llm_enabled
+from app.services.speech_writer import (
+    count_speech_characters,
+    estimate_minutes,
+    generate_speech,
+)
 from app.storage.audio import MeetingAudioWriter
 from app.storage.mongo import MeetingRepository
+from app.storage.mongo import utc_now
+from app.storage.speakers import (
+    delete_speaker_samples,
+    save_speaker_sample,
+    speaker_sample_path,
+)
 
 
 SAMPLE_RATE = 16_000
@@ -29,6 +43,9 @@ SILENCE_TO_FINAL_MS = 900
 BLOCK_SEGMENT_MS = 6_000
 OVERLAP_MS = 1_000
 SPEECH_RMS_FALLBACK = 0.012
+SPEAKER_EARLY_IDENTIFY_SAMPLES = round(
+    env_float("HUIYI_SPEAKER_EARLY_IDENTIFY_SECONDS", 2.25) * SAMPLE_RATE
+)
 PATHOLOGICAL_REPEAT_PATTERN = re.compile(r"(.{1,8}?)\1{4,}")
 
 
@@ -43,15 +60,22 @@ app.add_middleware(
 
 asr_engine: FunASRNanoEngine | None = None
 vad_factory: SileroVadFactory | None = None
+speaker_engine: SpeakerEmbeddingEngine | None = None
+speaker_error: str | None = None
 engine_error: str | None = None
 repository: MeetingRepository | None = None
 storage_error: str | None = None
 analysis_tasks: set[asyncio.Task] = set()
 
 
+def is_transient_executor_shutdown(error: Exception) -> bool:
+    return isinstance(error, RuntimeError) and "Executor shutdown has been called" in str(error)
+
+
 @app.on_event("startup")
 async def load_engines() -> None:
-    global asr_engine, vad_factory, engine_error, repository, storage_error
+    global asr_engine, vad_factory, speaker_engine, speaker_error
+    global engine_error, repository, storage_error
     try:
         asr_engine, vad_factory = await asyncio.gather(
             asyncio.to_thread(FunASRNanoEngine),
@@ -62,6 +86,16 @@ async def load_engines() -> None:
         asr_engine = None
         vad_factory = None
         engine_error = str(error)
+    if env_bool("HUIYI_SPEAKER_ENABLED", False):
+        try:
+            speaker_engine = await asyncio.to_thread(SpeakerEmbeddingEngine)
+            speaker_error = None
+        except Exception as error:
+            speaker_engine = None
+            speaker_error = str(error)
+    else:
+        speaker_engine = None
+        speaker_error = None
     try:
         repository = await asyncio.to_thread(MeetingRepository)
         storage_error = None
@@ -105,9 +139,12 @@ class AudioSession:
     last_preview_sample: int = 0
     last_preview_text: str = ""
     preview_task: asyncio.Task | None = None
+    speaker_preview_task: asyncio.Task | None = None
+    speaker_preview_segment_id: str = ""
     sequence: int = 0
     last_final_text: str = ""
     paused: bool = False
+    speaker_tracker: MeetingSpeakerTracker | None = None
 
     @property
     def position_ms(self) -> int:
@@ -123,6 +160,7 @@ class AudioSession:
         )
         self.last_speech_sample = self.received_samples if self.audio_samples else None
         self.last_preview_text = ""
+        self.speaker_preview_segment_id = ""
 
 
 def milliseconds(sample_index: int) -> int:
@@ -211,6 +249,27 @@ async def send_preview(
     )
 
 
+async def send_speaker_preview(
+    websocket: WebSocket,
+    session: AudioSession,
+    segment_id: str,
+    samples: list[int],
+) -> None:
+    if session.speaker_tracker is None:
+        return
+    analysis = await asyncio.to_thread(session.speaker_tracker.identify_preview, samples)
+    if session.segment_id != segment_id or analysis.status != "recognized":
+        return
+    session.speaker_preview_segment_id = segment_id
+    await websocket.send_json(
+        {
+            "type": "speaker.preview",
+            "segment_id": segment_id,
+            **analysis.as_dict(),
+        }
+    )
+
+
 def log_preview_error(task: asyncio.Task) -> None:
     if task.cancelled():
         return
@@ -239,6 +298,69 @@ def schedule_preview(websocket: WebSocket, session: AudioSession) -> None:
     session.preview_task.add_done_callback(log_preview_error)
 
 
+def schedule_speaker_preview(websocket: WebSocket, session: AudioSession) -> None:
+    if session.speaker_tracker is None:
+        return
+    if len(session.audio_samples) < SPEAKER_EARLY_IDENTIFY_SAMPLES:
+        return
+    if session.speaker_preview_segment_id == session.segment_id:
+        return
+    if session.speaker_preview_task is not None and not session.speaker_preview_task.done():
+        return
+    session.speaker_preview_task = asyncio.create_task(
+        send_speaker_preview(
+            websocket,
+            session,
+            session.segment_id,
+            session.audio_samples[-SPEAKER_EARLY_IDENTIFY_SAMPLES:].copy(),
+        )
+    )
+    session.speaker_preview_task.add_done_callback(log_preview_error)
+
+
+async def save_and_send_segment(
+    websocket: WebSocket,
+    session: AudioSession,
+    segment_id: str,
+    text: str,
+    original_text: str,
+    start_ms: int,
+    end_ms: int,
+    speaker_data: dict,
+) -> None:
+    speaker_name = speaker_data.get("speaker", "发言人")
+    segment = {
+        "id": segment_id,
+        "meeting_id": session.meeting_id,
+        "sequence": session.sequence,
+        "speaker": speaker_name,
+        "original_text": original_text,
+        "text": text,
+        "edited_text": text,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        **speaker_data,
+    }
+    if repository is not None:
+        await asyncio.to_thread(repository.save_segment, segment)
+    await websocket.send_json(
+        {
+            "type": "transcript.final",
+            "segment_id": segment_id,
+            "speaker": speaker_name,
+            "speaker_id": speaker_data.get("speaker_id", ""),
+            "speaker_confidence": speaker_data.get("speaker_confidence", 0),
+            "speaker_status": speaker_data.get("speaker_status", "disabled"),
+            "speaker_profile_id": speaker_data.get("speaker_profile_id", ""),
+            "text": text,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+        }
+    )
+    session.last_final_text = f"{session.last_final_text}{text}"[-100:]
+    session.sequence += 1
+
+
 async def send_final(
     websocket: WebSocket, session: AudioSession, retain_overlap: bool = False
 ) -> None:
@@ -253,36 +375,37 @@ async def send_final(
     final_samples = session.audio_samples.copy()
     # 预览只负责低延迟展示；积木结算必须重新识别完整音频块，
     # 避免将预览阶段的缺字、误识别或重复生成永久写入会议记录。
-    text = await transcribe_samples(final_samples)
-    clean_text = deduplicate_overlap(session.last_final_text, text)
+    speaker_task = (
+        asyncio.to_thread(
+            session.speaker_tracker.analyze,
+            final_samples,
+            milliseconds(session.segment_start_sample),
+        )
+        if session.speaker_tracker is not None
+        else None
+    )
+    if speaker_task is None:
+        text = await transcribe_samples(final_samples)
+        speaker_analysis = None
+    else:
+        text, speaker_analysis = await asyncio.gather(
+            transcribe_samples(final_samples), speaker_task
+        )
     start_ms = milliseconds(session.segment_start_sample)
     end_ms = milliseconds(session.last_speech_sample or session.received_samples)
+    clean_text = deduplicate_overlap(session.last_final_text, text)
     if clean_text:
-        segment = {
-            "id": session.segment_id,
-            "meeting_id": session.meeting_id,
-            "sequence": session.sequence,
-            "speaker": "发言人",
-            "original_text": text,
-            "text": clean_text,
-            "edited_text": clean_text,
-            "start_ms": start_ms,
-            "end_ms": end_ms,
-        }
-        if repository is not None:
-            await asyncio.to_thread(repository.save_segment, segment)
-        await websocket.send_json(
-            {
-                "type": "transcript.final",
-                "segment_id": session.segment_id,
-                "speaker": "发言人",
-                "text": clean_text,
-                "start_ms": start_ms,
-                "end_ms": end_ms,
-            }
+        speaker_data = speaker_analysis.as_dict() if speaker_analysis else {}
+        await save_and_send_segment(
+            websocket,
+            session,
+            session.segment_id,
+            clean_text,
+            text,
+            start_ms,
+            end_ms,
+            speaker_data,
         )
-        session.last_final_text = f"{session.last_final_text}{clean_text}"[-100:]
-        session.sequence += 1
 
     overlap = (
         final_samples[-(OVERLAP_MS * SAMPLE_RATE // 1000) :]
@@ -322,6 +445,7 @@ async def process_audio(websocket: WebSocket, session: AudioSession, chunk: byte
         ):
             session.last_preview_sample = session.received_samples
             schedule_preview(websocket, session)
+            schedule_speaker_preview(websocket, session)
 
         if len(session.audio_samples) >= BLOCK_SEGMENT_MS * SAMPLE_RATE // 1000:
             await send_final(websocket, session, retain_overlap=True)
@@ -391,11 +515,28 @@ async def health() -> dict[str, str]:
         "vad_model_path": str(vad_factory.model_path),
         "storage": "mongodb" if repository is not None else f"error: {storage_error}",
         "llm": "enabled" if llm_enabled() else "disabled",
+        "speaker": (
+            "enabled"
+            if speaker_engine is not None
+            else f"disabled: {speaker_error}" if speaker_error else "disabled"
+        ),
+        "speaker_model_path": (
+            str(speaker_engine.model_path) if speaker_engine is not None else ""
+        ),
     }
 
 
 class SegmentUpdate(BaseModel):
     text: str
+
+
+class SpeechGenerateRequest(BaseModel):
+    prompt: str
+
+
+class SpeechUpdate(BaseModel):
+    title: str
+    content: str
 
 
 @app.get("/api/meetings")
@@ -438,6 +579,231 @@ async def get_meeting_audio(meeting_id: str):
     if not audio_path.is_file():
         raise HTTPException(status_code=404, detail="会议音频不存在")
     return FileResponse(audio_path, media_type="audio/wav", filename=f"{meeting_id}.wav")
+
+
+def prepare_speaker_sample(pcm_bytes: bytes) -> tuple[list[int], int]:
+    if len(pcm_bytes) % 2:
+        raise HTTPException(status_code=400, detail="PCM16 音频字节长度无效")
+    samples = array("h")
+    samples.frombytes(pcm_bytes)
+    duration_ms = milliseconds(len(samples))
+    if duration_ms < 3_000:
+        raise HTTPException(status_code=400, detail="声纹样本至少需要 3 秒有效录音")
+    if duration_ms > 30_000:
+        raise HTTPException(status_code=400, detail="声纹样本不能超过 30 秒")
+    return samples.tolist(), duration_ms
+
+
+async def extract_speaker_sample(pcm_bytes: bytes) -> tuple[list[float], int]:
+    if speaker_engine is None:
+        raise HTTPException(status_code=503, detail=speaker_error or "声纹引擎未启用")
+    samples, duration_ms = prepare_speaker_sample(pcm_bytes)
+    embedding = await asyncio.to_thread(speaker_engine.extract, samples)
+    if embedding is None:
+        raise HTTPException(status_code=400, detail="录音质量不足，请靠近麦克风重新录制")
+    return embedding.tolist(), duration_ms
+
+
+@app.get("/api/speakers")
+async def list_speaker_profiles() -> list[dict]:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    return await asyncio.to_thread(repository.list_speaker_profiles)
+
+
+@app.post("/api/speakers")
+async def create_speaker_profile(name: str, request: Request) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    clean_name = name.strip()
+    if not clean_name or len(clean_name) > 40:
+        raise HTTPException(status_code=400, detail="请输入 1 到 40 个字符的姓名")
+    pcm_bytes = await request.body()
+    embedding, duration_ms = await extract_speaker_sample(pcm_bytes)
+    profile_id = str(uuid4())
+    sample_id = str(uuid4())
+    path = await asyncio.to_thread(
+        save_speaker_sample, profile_id, sample_id, pcm_bytes
+    )
+    sample = {
+        "id": sample_id,
+        "duration_ms": duration_ms,
+        "audio_path": str(path),
+        "created_at": utc_now(),
+    }
+    return await asyncio.to_thread(
+        repository.create_speaker_profile,
+        profile_id,
+        clean_name,
+        embedding,
+        sample,
+    )
+
+
+@app.post("/api/speakers/{profile_id}/samples")
+async def add_speaker_profile_sample(profile_id: str, request: Request) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    profile = await asyncio.to_thread(
+        repository.get_speaker_profile, profile_id, True
+    )
+    if profile is None:
+        raise HTTPException(status_code=404, detail="声纹身份不存在")
+    pcm_bytes = await request.body()
+    embedding, duration_ms = await extract_speaker_sample(pcm_bytes)
+    embeddings = [
+        np.asarray(item, dtype=np.float32)
+        for item in [*profile.get("embeddings", []), embedding]
+    ]
+    centroid = np.mean(embeddings, axis=0)
+    centroid /= np.linalg.norm(centroid)
+    sample_id = str(uuid4())
+    path = await asyncio.to_thread(
+        save_speaker_sample, profile_id, sample_id, pcm_bytes
+    )
+    sample = {
+        "id": sample_id,
+        "duration_ms": duration_ms,
+        "audio_path": str(path),
+        "created_at": utc_now(),
+    }
+    return await asyncio.to_thread(
+        repository.add_speaker_sample,
+        profile_id,
+        embedding,
+        centroid.tolist(),
+        sample,
+    )
+
+
+@app.get("/api/speakers/{profile_id}/samples/{sample_id}/audio")
+async def get_speaker_sample_audio(profile_id: str, sample_id: str):
+    path = speaker_sample_path(profile_id, sample_id)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="声纹样本音频不存在")
+    return FileResponse(path, media_type="audio/wav", filename=f"{sample_id}.wav")
+
+
+@app.delete("/api/speakers/{profile_id}")
+async def delete_speaker_profile(profile_id: str) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    deleted = await asyncio.to_thread(repository.delete_speaker_profile, profile_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="声纹身份不存在")
+    await asyncio.to_thread(delete_speaker_samples, profile_id)
+    return {"status": "ok"}
+
+
+@app.get("/api/speeches")
+async def list_speeches() -> list[dict]:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    return await asyncio.to_thread(repository.list_speeches)
+
+
+@app.post("/api/speeches")
+async def create_speech(request: SpeechGenerateRequest) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    prompt = request.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="请输入演讲稿需求描述")
+    try:
+        generated = await asyncio.to_thread(generate_speech, prompt)
+    except RuntimeError as error:
+        if is_transient_executor_shutdown(error):
+            raise HTTPException(status_code=503, detail="服务正在重启，请稍后重试") from error
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    try:
+        return await asyncio.to_thread(
+            repository.create_speech, str(uuid4()), prompt, generated
+        )
+    except RuntimeError as error:
+        if is_transient_executor_shutdown(error):
+            raise HTTPException(status_code=503, detail="服务正在重启，请稍后重试") from error
+        raise
+
+
+@app.get("/api/speeches/{speech_id}")
+async def get_speech(speech_id: str) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    speech = await asyncio.to_thread(repository.get_speech, speech_id)
+    if speech is None:
+        raise HTTPException(status_code=404, detail="演讲稿不存在")
+    return speech
+
+
+@app.patch("/api/speeches/{speech_id}")
+async def update_speech(speech_id: str, update: SpeechUpdate) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    title = update.title.strip() or "未命名演讲稿"
+    content = update.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="演讲稿正文不能为空")
+    stats = {
+        "word_count": count_speech_characters(content),
+        "estimated_minutes": estimate_minutes(content),
+    }
+    speech = await asyncio.to_thread(
+        repository.update_speech, speech_id, title[:100], content, stats
+    )
+    if speech is None:
+        raise HTTPException(status_code=404, detail="演讲稿不存在")
+    return speech
+
+
+@app.post("/api/speeches/{speech_id}/regenerate")
+async def regenerate_speech(speech_id: str) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    speech = await asyncio.to_thread(repository.get_speech, speech_id)
+    if speech is None:
+        raise HTTPException(status_code=404, detail="演讲稿不存在")
+    try:
+        generated = await asyncio.to_thread(generate_speech, speech["prompt"])
+    except RuntimeError as error:
+        if is_transient_executor_shutdown(error):
+            raise HTTPException(status_code=503, detail="服务正在重启，请稍后重试") from error
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    try:
+        return await asyncio.to_thread(repository.regenerate_speech, speech_id, generated)
+    except RuntimeError as error:
+        if is_transient_executor_shutdown(error):
+            raise HTTPException(status_code=503, detail="服务正在重启，请稍后重试") from error
+        raise
+
+
+@app.delete("/api/speeches/{speech_id}")
+async def delete_speech(speech_id: str) -> dict:
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    deleted = await asyncio.to_thread(repository.delete_speech, speech_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="演讲稿不存在")
+    return {"status": "ok"}
+
+
+@app.get("/api/speeches/{speech_id}/export/docx")
+async def export_speech_docx(speech_id: str):
+    if repository is None:
+        raise HTTPException(status_code=503, detail=storage_error or "MongoDB不可用")
+    speech = await asyncio.to_thread(repository.get_speech, speech_id)
+    if speech is None:
+        raise HTTPException(status_code=404, detail="演讲稿不存在")
+    document = await asyncio.to_thread(build_speech_docx, speech)
+    filename = quote(f"{speech['title'] or '演讲稿'}.docx")
+    return StreamingResponse(
+        document,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
 
 
 @app.get("/api/meetings/{meeting_id}/export/docx")
@@ -493,6 +859,15 @@ async def live_meeting(websocket: WebSocket) -> None:
         vad=vad_factory.create(),
         meeting_id=meeting_id,
         audio_writer=MeetingAudioWriter(meeting_id),
+        speaker_tracker=(
+            speaker_engine.create_tracker(
+                await asyncio.to_thread(
+                    repository.list_speaker_profiles, True
+                )
+            )
+            if speaker_engine is not None
+            else None
+        ),
     )
     try:
         while True:

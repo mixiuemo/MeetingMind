@@ -23,9 +23,15 @@ backend/   FastAPI WebSocket 后端
 - 历史会议查看、回放与文字时间跳转
 - Word 文档导出，包含 AI 纪要、待办事项、完整原文及纪要到原文的内部跳转
 - 本地或 OpenAI 兼容 LLM 生成会议摘要、核心要点、结论、未决问题与待办
+- 独立 AI 演讲稿生成、历史保存、正文编辑与 Word 导出
 - 6秒积木、1秒重叠识别与文字去重
+- Speaker Embedding 滑窗分析、会议内说话人聚类与积木主导发言人识别
+- 声纹身份库、麦克风注册、多样本管理与会议实时实名匹配
+- 约 2.25 秒提前身份预判
 
 后端使用 sherpa-onnx 加载 FunASR Nano INT8 模型进行真实转写。
+
+声纹识别与说话人区分的后续实施计划见 [SPEAKER_TODO.md](SPEAKER_TODO.md)。
 
 ## 后端配置
 
@@ -40,6 +46,7 @@ HUIYI_LLM_BASE_URL=http://127.0.0.1:11434/v1
 HUIYI_LLM_API_KEY=ollama
 HUIYI_LLM_MODEL=qwen3.5:4b
 HUIYI_LLM_REASONING_EFFORT=none
+HUIYI_SPEECH_MAX_TOKENS=4000
 ```
 
 切换第三方 OpenAI 兼容 API 时，修改地址、API Key、模型名即可。若第三方接口

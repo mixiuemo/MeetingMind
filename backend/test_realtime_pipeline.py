@@ -2,6 +2,8 @@ import asyncio
 import wave
 from pathlib import Path
 
+import numpy as np
+
 from app import main as meeting
 
 
@@ -33,9 +35,23 @@ class AudioWriterStub:
 async def main() -> None:
     await meeting.load_engines()
     websocket = MessageCollector()
+    with wave.open(str(TEST_WAV), "rb") as wav_file:
+        registered_samples = np.frombuffer(
+            wav_file.readframes(wav_file.getnframes()), dtype=np.int16
+        )
+    registered_embedding = meeting.speaker_engine.extract(registered_samples)
     session = meeting.AudioSession(
         vad=meeting.vad_factory.create(),
         audio_writer=AudioWriterStub(),
+        speaker_tracker=meeting.speaker_engine.create_tracker(
+            [
+                {
+                    "id": "registered-speaker",
+                    "name": "测试用户",
+                    "centroid": registered_embedding.tolist(),
+                }
+            ]
+        ),
     )
 
     with wave.open(str(TEST_WAV), "rb") as wav_file:
@@ -47,14 +63,24 @@ async def main() -> None:
     await meeting.send_final(websocket, session)
 
     finals = [
-        message["text"]
+        message
         for message in websocket.messages
         if message["type"] == "transcript.final"
     ]
     assert len(finals) >= 2
+    assert all(message.get("speaker_id") for message in finals)
+    assert all(message.get("speaker_status") for message in finals)
+    speaker_previews = [
+        message
+        for message in websocket.messages
+        if message["type"] == "speaker.preview"
+    ]
+    assert speaker_previews
+    assert speaker_previews[0]["speaker"] == "测试用户"
+    print(f"early speaker preview: {speaker_previews[0]['speaker']}")
     print(f"final blocks: {len(finals)}")
-    for text in finals:
-        print(text)
+    for message in finals:
+        print(message["speaker"], message["speaker_status"], message["text"])
 
 
 if __name__ == "__main__":

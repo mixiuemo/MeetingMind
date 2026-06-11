@@ -7,6 +7,7 @@ from app.config import env_bool, env_int
 
 
 JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
+JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
 SYSTEM_PROMPT = """你是严谨的中文会议纪要助手。请仅依据提供的会议转写生成分析，不得编造。
 仅提取会议中明确提出、承诺或分配的待办；没有明确待办时 action_items 必须为空数组。
@@ -31,16 +32,21 @@ def llm_enabled() -> bool:
     return env_bool("HUIYI_LLM_ENABLED", True)
 
 
-def _chat(messages: list[dict]) -> str:
+def _chat(
+    messages: list[dict],
+    *,
+    temperature: float = 0.1,
+    max_tokens: int | None = None,
+) -> str:
     base_url = os.getenv("HUIYI_LLM_BASE_URL", "http://127.0.0.1:11434/v1").rstrip("/")
     body = {
         "model": os.getenv("HUIYI_LLM_MODEL", "qwen3.5:4b"),
         "messages": messages,
-        "temperature": 0.1,
+        "temperature": temperature,
         "stream": False,
         "keep_alive": -1,
         "think": False,
-        "max_tokens": env_int("HUIYI_LLM_MAX_TOKENS", 1600),
+        "max_tokens": max_tokens or env_int("HUIYI_LLM_MAX_TOKENS", 1600),
         "response_format": {"type": "json_object"},
     }
     reasoning_effort = os.getenv("HUIYI_LLM_REASONING_EFFORT", "").strip()
@@ -64,14 +70,91 @@ def _chat(messages: list[dict]) -> str:
     return result["choices"][0]["message"]["content"]
 
 
+def _strip_code_fence(content: str) -> str:
+    match = JSON_FENCE.search(content)
+    return match.group(1).strip() if match else content.strip()
+
+
+def _balanced_json_object(content: str) -> str | None:
+    start = content.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(content)):
+        char = content[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return content[start : index + 1]
+    return None
+
+
+def _normalize_json_candidate(content: str) -> str:
+    normalized = content.strip().replace("\ufeff", "")
+    normalized = normalized.replace("“", '"').replace("”", '"')
+    normalized = normalized.replace("‘", "'").replace("’", "'")
+    normalized = re.sub(r",(\s*[}\]])", r"\1", normalized)
+    return normalized
+
+
+def _repair_json_with_llm(content: str) -> dict:
+    repaired = _chat(
+        [
+            {
+                "role": "system",
+                "content": "你是 JSON 修复助手。把用户提供的内容修复为一个合法 JSON 对象。"
+                "不得新增字段，不得删除已有字段，只能修复转义、引号、逗号、换行和代码块包装问题。"
+                "输出必须是 JSON 对象本身。",
+            },
+            {"role": "user", "content": content},
+        ],
+        temperature=0,
+        max_tokens=env_int("HUIYI_LLM_MAX_TOKENS", 1600),
+    )
+    return json.loads(_strip_code_fence(repaired))
+
+
 def _parse_json(content: str) -> dict:
+    candidates = []
+    stripped = _strip_code_fence(content)
+    if stripped:
+        candidates.append(stripped)
+    balanced = _balanced_json_object(stripped)
+    if balanced and balanced not in candidates:
+        candidates.append(balanced)
+    match = JSON_BLOCK.search(stripped)
+    if match and match.group(0) not in candidates:
+        candidates.append(match.group(0))
+
+    errors = []
+    for candidate in candidates:
+        for variant in (candidate, _normalize_json_candidate(candidate)):
+            try:
+                return json.loads(variant)
+            except json.JSONDecodeError as error:
+                errors.append(error)
+
     try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        match = JSON_BLOCK.search(content)
-        if not match:
-            raise ValueError("LLM 未返回有效 JSON")
-        return json.loads(match.group(0))
+        return _repair_json_with_llm(stripped or content)
+    except Exception as error:
+        if errors:
+            last_error = errors[-1]
+            raise ValueError(f"LLM 未返回有效 JSON: {last_error}") from error
+        raise ValueError("LLM 未返回有效 JSON") from error
 
 
 def _normalize_items(items, text_key: str, valid_ids: set[str]) -> list[dict]:

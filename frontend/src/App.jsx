@@ -32,20 +32,28 @@ function findActiveSegment(segments, currentMs) {
   return null;
 }
 
+function speakerAccent(speakerId) {
+  const palette = ["#8ca5ff", "#68e7b2", "#ef9f78", "#c596ff", "#65c8e8", "#e4c66e"];
+  const match = String(speakerId || "").match(/(\d+)$/);
+  const index = match ? Math.max(0, Number(match[1]) - 1) : 0;
+  return palette[index % palette.length];
+}
+
 const LiveSegment = memo(function LiveSegment({
   segment,
   previewText,
+  previewSpeaker,
   onChange,
 }) {
   return (
-    <article className="segment">
+    <article className="segment" style={{ "--speaker-accent": speakerAccent(segment.speakerId) }}>
       <div className="timeline-mark">
         <span>{formatTime(segment.startMs)}</span>
         <i />
       </div>
       <div className="segment-content">
         <div className="segment-meta">
-          <strong>{segment.speaker}</strong>
+          <strong className="speaker-name">{segment.speaker}</strong>
           <span>{formatTime(segment.startMs)} - {formatTime(segment.endMs)}</span>
         </div>
         <textarea
@@ -53,7 +61,12 @@ const LiveSegment = memo(function LiveSegment({
           rows={Math.max(3, Math.ceil(segment.text.length / 35))}
           onChange={(event) => onChange(segment.id, event.target.value)}
         />
-        {previewText && <p className="inline-preview">{previewText}</p>}
+        {previewText && (
+          <>
+            {previewSpeaker && <span className="preview-speaker">可能是 {previewSpeaker}</span>}
+            <p className="inline-preview">{previewText}</p>
+          </>
+        )}
         {segment.text !== segment.originalText && <span className="edited-mark">已编辑</span>}
       </div>
     </article>
@@ -72,6 +85,7 @@ const HistorySegment = memo(function HistorySegment({
     <article
       id={`history-segment-${segment.id}`}
       className={`history-segment ${active ? "playing" : ""}`}
+      style={{ "--speaker-accent": speakerAccent(segment.speaker_id) }}
       onClick={() => onPlay(segment)}
     >
       <button
@@ -85,7 +99,10 @@ const HistorySegment = memo(function HistorySegment({
         <span>{formatTime(segment.start_ms)}</span>
       </button>
       <div>
-        <strong>{segment.speaker}</strong>
+        <strong className="speaker-name" title={segment.speaker_status === "uncertain" ? "说话人识别置信度较低" : ""}>
+          {segment.speaker}
+          {segment.speaker_status === "uncertain" && <span className="speaker-uncertain">待确认</span>}
+        </strong>
         <textarea
           value={segment.text}
           rows={Math.max(2, Math.ceil(segment.text.length / 38))}
@@ -231,6 +248,18 @@ function App() {
   const [audioCurrentTime, setAudioCurrentTime] = useState(0);
   const [audioDuration, setAudioDuration] = useState(0);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [speakerProfiles, setSpeakerProfiles] = useState([]);
+  const [speakerName, setSpeakerName] = useState("");
+  const [speakerRecording, setSpeakerRecording] = useState(false);
+  const [speakerRecordingMs, setSpeakerRecordingMs] = useState(0);
+  const [speakerLevel, setSpeakerLevel] = useState(0);
+  const [speakerTargetId, setSpeakerTargetId] = useState(null);
+  const [speakerNotice, setSpeakerNotice] = useState("录制一段自然、清晰的语音来创建声纹身份。");
+  const [speeches, setSpeeches] = useState([]);
+  const [selectedSpeech, setSelectedSpeech] = useState(null);
+  const [speechPrompt, setSpeechPrompt] = useState("");
+  const [speechBusy, setSpeechBusy] = useState(false);
+  const [speechNotice, setSpeechNotice] = useState("描述你需要的演讲稿，AI 会自动理解并撰写完整正文。");
 
   const socketRef = useRef(null);
   const streamRef = useRef(null);
@@ -246,6 +275,39 @@ function App() {
   const historySegmentsRef = useRef(null);
   const lastLevelUpdateRef = useRef(0);
   const lastLevelRef = useRef(0);
+  const speakerCaptureRef = useRef(null);
+  const speakerTimerRef = useRef(null);
+  const speechContentRef = useRef(null);
+
+  async function wait(milliseconds) {
+    await new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+  }
+
+  async function fetchJsonWithRetry(url, options = {}, retryCount = 1) {
+    let lastError = null;
+    for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+      try {
+        const response = await fetch(url, options);
+        const result = await response.json();
+        if (response.ok) {
+          return result;
+        }
+        const detail = result?.detail || "请求失败";
+        if (attempt < retryCount && [500, 502, 503].includes(response.status)) {
+          await wait(700);
+          continue;
+        }
+        throw new Error(detail);
+      } catch (error) {
+        lastError = error;
+        if (attempt < retryCount) {
+          await wait(700);
+          continue;
+        }
+      }
+    }
+    throw lastError || new Error("请求失败");
+  }
 
   useEffect(() => {
     statusRef.current = status;
@@ -254,6 +316,8 @@ function App() {
   useEffect(() => {
     refreshDevices();
     loadMeetings();
+    loadSpeakerProfiles();
+    loadSpeeches();
     navigator.mediaDevices?.addEventListener("devicechange", refreshDevices);
     return () => navigator.mediaDevices?.removeEventListener("devicechange", refreshDevices);
   }, []);
@@ -278,7 +342,10 @@ function App() {
     return () => window.clearInterval(timer);
   }, [status]);
 
-  useEffect(() => () => closeResources(), []);
+  useEffect(() => () => {
+    closeResources();
+    closeSpeakerCapture();
+  }, []);
 
   useEffect(() => {
     if (selectedMeeting?.analysis_status !== "processing") {
@@ -295,6 +362,15 @@ function App() {
     }, 2000);
     return () => window.clearInterval(timer);
   }, [selectedMeeting?.id, selectedMeeting?.analysis_status]);
+
+  useEffect(() => {
+    const textarea = speechContentRef.current;
+    if (!textarea || !selectedSpeech) {
+      return;
+    }
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.max(850, textarea.scrollHeight)}px`;
+  }, [selectedSpeech?.id, selectedSpeech?.content]);
 
   useEffect(() => {
     if (historyTab !== "transcript" || !pendingSourceId) {
@@ -339,6 +415,126 @@ function App() {
     setDeviceId((current) => current || inputs[0]?.deviceId || "");
   }
 
+  async function loadSpeakerProfiles() {
+    try {
+      const response = await fetch(`${API_URL}/api/speakers`);
+      if (!response.ok) {
+        throw new Error("无法读取声纹库");
+      }
+      setSpeakerProfiles(await response.json());
+    } catch (error) {
+      setSpeakerNotice(error.message || "无法读取声纹库");
+    }
+  }
+
+  async function loadSpeeches() {
+    try {
+      const response = await fetch(`${API_URL}/api/speeches`);
+      const data = await response.json();
+      setSpeeches(Array.isArray(data) ? data : []);
+    } catch {
+      setSpeechNotice("无法读取历史演讲稿");
+    }
+  }
+
+  async function generateSpeech() {
+    if (!speechPrompt.trim() || speechBusy) {
+      return;
+    }
+    try {
+      setSpeechBusy(true);
+      setSpeechNotice("AI 正在撰写演讲稿...");
+      const result = await fetchJsonWithRetry(`${API_URL}/api/speeches`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: speechPrompt.trim() }),
+      });
+      setSelectedSpeech(result);
+      setSpeechPrompt("");
+      setSpeechNotice("演讲稿已生成，可以继续编辑或导出 Word。");
+      await loadSpeeches();
+    } catch (error) {
+      setSpeechNotice(error.message || "生成演讲稿失败");
+    } finally {
+      setSpeechBusy(false);
+    }
+  }
+
+  async function saveSpeech() {
+    if (!selectedSpeech || speechBusy) {
+      return false;
+    }
+    try {
+      setSpeechBusy(true);
+      const response = await fetch(`${API_URL}/api/speeches/${selectedSpeech.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: selectedSpeech.title,
+          content: selectedSpeech.content,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.detail || "保存演讲稿失败");
+      }
+      setSelectedSpeech(result);
+      setSpeechNotice("修改已保存。");
+      await loadSpeeches();
+      return true;
+    } catch (error) {
+      setSpeechNotice(error.message || "保存演讲稿失败");
+      return false;
+    } finally {
+      setSpeechBusy(false);
+    }
+  }
+
+  async function exportSelectedSpeech() {
+    if (!selectedSpeech || speechBusy) {
+      return;
+    }
+    const speechId = selectedSpeech.id;
+    const saved = await saveSpeech();
+    if (saved) {
+      window.location.href = `${API_URL}/api/speeches/${speechId}/export/docx`;
+    }
+  }
+
+  async function regenerateSelectedSpeech() {
+    if (!selectedSpeech || speechBusy) {
+      return;
+    }
+    try {
+      setSpeechBusy(true);
+      setSpeechNotice("AI 正在根据原始描述重新撰写...");
+      const result = await fetchJsonWithRetry(`${API_URL}/api/speeches/${selectedSpeech.id}/regenerate`, {
+        method: "POST",
+      });
+      setSelectedSpeech(result);
+      setSpeechNotice("演讲稿已重新生成。");
+      await loadSpeeches();
+    } catch (error) {
+      setSpeechNotice(error.message || "重新生成失败");
+    } finally {
+      setSpeechBusy(false);
+    }
+  }
+
+  async function deleteSelectedSpeech() {
+    if (!selectedSpeech || !window.confirm(`确认删除“${selectedSpeech.title}”吗？`)) {
+      return;
+    }
+    const response = await fetch(`${API_URL}/api/speeches/${selectedSpeech.id}`, {
+      method: "DELETE",
+    });
+    if (response.ok) {
+      setSelectedSpeech(null);
+      setSpeechNotice("演讲稿已删除。");
+      await loadSpeeches();
+    }
+  }
+
   function handleMessage(event) {
     let message;
     try {
@@ -351,12 +547,21 @@ function App() {
       setCurrentMeetingId(message.meeting_id || null);
       setNotice("会议转写进行中");
     } else if (message.type === "transcript.preview") {
-      setPreview({
+      setPreview((current) => ({
+        ...(current?.id === message.segment_id ? current : {}),
         id: message.segment_id || "preview",
         text: String(message.text || ""),
         startMs: Number(message.start_ms) || 0,
         endMs: Number(message.end_ms) || 0,
-      });
+      }));
+    } else if (message.type === "speaker.preview") {
+      setPreview((current) => ({
+        ...(current?.id === message.segment_id ? current : {}),
+        id: message.segment_id || "preview",
+        text: current?.id === message.segment_id ? current.text : "",
+        speaker: message.speaker || "",
+        speakerStatus: message.speaker_status || "",
+      }));
     } else if (message.type === "transcript.final") {
       const finalText = String(message.text || "");
       if (!finalText) {
@@ -365,8 +570,9 @@ function App() {
       setPreview((current) => current?.id === message.segment_id ? null : current);
       setSegments((current) => {
         const speaker = message.speaker || "发言人";
+        const speakerId = message.speaker_id || "";
         const last = current[current.length - 1];
-        if (last && last.speaker === speaker) {
+        if (last && last.speakerId === speakerId) {
           const text = joinTranscriptText(last.text, finalText);
           const originalText = joinTranscriptText(last.originalText, finalText);
           return [
@@ -376,6 +582,8 @@ function App() {
               text,
               originalText,
               endMs: Number(message.end_ms) || last.endMs,
+              speakerConfidence: Number(message.speaker_confidence) || last.speakerConfidence,
+              speakerStatus: message.speaker_status || last.speakerStatus,
             },
           ];
         }
@@ -386,6 +594,9 @@ function App() {
             text: finalText,
             originalText: finalText,
             speaker,
+            speakerId,
+            speakerConfidence: Number(message.speaker_confidence) || 0,
+            speakerStatus: message.speaker_status || "disabled",
             startMs: Number(message.start_ms) || 0,
             endMs: Number(message.end_ms) || 0,
           },
@@ -679,6 +890,125 @@ function App() {
     setLevel(0);
   }
 
+  function closeSpeakerCapture() {
+    const capture = speakerCaptureRef.current;
+    capture?.worklet?.disconnect();
+    capture?.source?.disconnect();
+    capture?.stream?.getTracks().forEach((track) => track.stop());
+    capture?.context?.close();
+    speakerCaptureRef.current = null;
+    if (speakerTimerRef.current) {
+      window.clearInterval(speakerTimerRef.current);
+      speakerTimerRef.current = null;
+    }
+    setSpeakerRecording(false);
+    setSpeakerLevel(0);
+  }
+
+  async function startSpeakerRecording(profileId = null) {
+    if (isActive) {
+      setSpeakerNotice("会议进行中无法注册声纹，请结束会议后再录制。");
+      return;
+    }
+    if (!profileId && !speakerName.trim()) {
+      setSpeakerNotice("请先输入需要注册的姓名。");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      const context = new AudioContext();
+      await context.audioWorklet.addModule("/audio-capture-worklet.js");
+      const source = context.createMediaStreamSource(stream);
+      const worklet = new AudioWorkletNode(context, "audio-capture-processor");
+      const silentGain = context.createGain();
+      silentGain.gain.value = 0;
+      const chunks = [];
+      const startedAt = Date.now();
+      worklet.port.onmessage = ({ data }) => {
+        setSpeakerLevel(calculateLevel(data));
+        chunks.push(prepareAudioChunk(data, context.sampleRate));
+      };
+      source.connect(worklet);
+      worklet.connect(silentGain);
+      silentGain.connect(context.destination);
+      speakerCaptureRef.current = { stream, context, source, worklet, chunks, startedAt };
+      setSpeakerTargetId(profileId);
+      setSpeakerRecordingMs(0);
+      setSpeakerRecording(true);
+      setSpeakerNotice(profileId ? "正在追加声音样本，请自然说话。" : "正在录制首条声纹样本，请自然说话。");
+      speakerTimerRef.current = window.setInterval(() => {
+        setSpeakerRecordingMs(Date.now() - startedAt);
+      }, 100);
+    } catch (error) {
+      closeSpeakerCapture();
+      setSpeakerNotice(error.message || "无法启动麦克风");
+    }
+  }
+
+  async function finishSpeakerRecording() {
+    const capture = speakerCaptureRef.current;
+    if (!capture) {
+      return;
+    }
+    const duration = Date.now() - capture.startedAt;
+    const chunks = capture.chunks;
+    const profileId = speakerTargetId;
+    closeSpeakerCapture();
+    if (duration < 3000) {
+      setSpeakerNotice("录音至少需要 3 秒，请重新录制。");
+      return;
+    }
+    const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const pcm = new Int16Array(totalLength);
+    let offset = 0;
+    chunks.forEach((chunk) => {
+      pcm.set(chunk, offset);
+      offset += chunk.length;
+    });
+    try {
+      setSpeakerNotice("正在提取声纹并保存...");
+      const url = profileId
+        ? `${API_URL}/api/speakers/${profileId}/samples`
+        : `${API_URL}/api/speakers?name=${encodeURIComponent(speakerName.trim())}`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: pcm.buffer,
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.detail || "声纹注册失败");
+      }
+      setSpeakerName("");
+      setSpeakerTargetId(null);
+      setSpeakerNotice(profileId ? "声音样本已追加。" : "声纹身份已创建。");
+      await loadSpeakerProfiles();
+    } catch (error) {
+      setSpeakerNotice(error.message || "声纹注册失败");
+    }
+  }
+
+  async function deleteSpeakerProfile(profile) {
+    if (!window.confirm(`确认删除“${profile.name}”的声纹资料吗？历史会议不会被删除。`)) {
+      return;
+    }
+    const response = await fetch(`${API_URL}/api/speakers/${profile.id}`, { method: "DELETE" });
+    if (response.ok) {
+      setSpeakerNotice(`已删除“${profile.name}”的声纹资料。`);
+      await loadSpeakerProfiles();
+    } else {
+      setSpeakerNotice("删除声纹身份失败。");
+    }
+  }
+
   function endMeeting() {
     if (socketRef.current?.readyState === WebSocket.OPEN) {
       socketRef.current.send(JSON.stringify({ type: "meeting.end" }));
@@ -763,14 +1093,16 @@ function App() {
         <nav
           className="glass-nav"
           style={{
-            "--nav-count": isActive ? 3 : 2,
-            "--nav-index": view === "home" ? 0 : view === "live" ? 1 : isActive ? 2 : 1,
+            "--nav-count": isActive ? 5 : 4,
+            "--nav-index": view === "home" ? 0 : view === "live" ? 1 : view === "history" ? (isActive ? 2 : 1) : view === "speeches" ? (isActive ? 3 : 2) : (isActive ? 4 : 3),
           }}
         >
           <span className="nav-indicator" aria-hidden="true" />
           <button className={view === "home" ? "active" : ""} onClick={() => setView("home")}>首页</button>
           {isActive && <button className={view === "live" ? "active" : ""} onClick={() => setView("live")}>会议现场</button>}
           <button className={view === "history" ? "active" : ""} onClick={openHistory}>历史记录</button>
+          <button className={view === "speeches" ? "active" : ""} onClick={() => { setView("speeches"); loadSpeeches(); }}>演讲稿</button>
+          <button className={view === "speakers" ? "active" : ""} onClick={() => { setView("speakers"); loadSpeakerProfiles(); }}>声纹库</button>
         </nav>
         {isActive ? <div className="meeting-summary">
           <div className={`live-state ${status}`}>
@@ -779,7 +1111,7 @@ function App() {
           </div>
           <span className="summary-divider" />
           <strong>{formatTime(elapsedMs)}</strong>
-        </div> : <button className="top-create" onClick={openCreateMeeting}>新建会议</button>}
+        </div> : <button className="top-create" onClick={openCreateMeeting}>会议记录</button>}
       </header>
 
       <main className="workspace">
@@ -790,7 +1122,7 @@ function App() {
               <h2>让每一次发言<br />都成为清晰记录</h2>
               <p className="hero-description">从实时转写到完整回放，把会议里的声音沉淀为可搜索、可编辑、可追溯的内容资产。</p>
               <div className="hero-actions">
-                <button className="hero-primary" onClick={openCreateMeeting}><span />新建会议</button>
+                <button className="hero-primary" onClick={openCreateMeeting}><span />会议记录</button>
                 <button className="hero-secondary" onClick={openHistory}>浏览会议档案</button>
               </div>
             </div>
@@ -859,6 +1191,7 @@ function App() {
                 key={segment.id}
                 segment={segment}
                 previewText={index === segments.length - 1 ? preview?.text : ""}
+                previewSpeaker={index === segments.length - 1 ? preview?.speaker : ""}
                 onChange={updateSegment}
               />
             ))}
@@ -871,7 +1204,7 @@ function App() {
                 </div>
                 <div className="segment-content">
                   <div className="segment-meta">
-                    <strong>实时转写</strong>
+                    <strong>{preview.speaker ? `可能是 ${preview.speaker}` : "实时转写"}</strong>
                     <span>正在聆听</span>
                   </div>
                   <p className="inline-preview">{preview.text}</p>
@@ -997,6 +1330,153 @@ function App() {
                 </>
               )}
             </section>
+          </section>
+        )}
+
+        {view === "speakers" && (
+          <section className="speaker-library">
+            <div className="speaker-library-heading">
+              <div>
+                <p className="section-label">VOICE IDENTITY</p>
+                <h2>声纹库</h2>
+                <p>为常用参会者保存多个声音样本，让新的会议自动显示真实姓名。</p>
+              </div>
+              <div className={`speaker-record-status ${speakerRecording ? "recording" : ""}`}>
+                <span />
+                {speakerRecording ? `录制中 ${formatTime(speakerRecordingMs)}` : `${speakerProfiles.length} 个身份`}
+              </div>
+            </div>
+
+            <div className="speaker-register-panel">
+              <div className="speaker-register-copy">
+                <p className="hero-kicker">NEW VOICE PROFILE</p>
+                <h3>{speakerTargetId ? "追加声音样本" : "注册新的声音身份"}</h3>
+                <p>{speakerNotice}</p>
+              </div>
+              <div className="speaker-register-controls">
+                {!speakerTargetId && (
+                  <input
+                    value={speakerName}
+                    maxLength={40}
+                    placeholder="输入姓名，例如：张三"
+                    disabled={speakerRecording}
+                    onChange={(event) => setSpeakerName(event.target.value)}
+                  />
+                )}
+                <div className="speaker-level"><i style={{ width: `${speakerLevel * 100}%` }} /></div>
+                {speakerRecording ? (
+                  <button className="speaker-stop" onClick={finishSpeakerRecording}>完成录制</button>
+                ) : (
+                  <button className="speaker-record" onClick={() => startSpeakerRecording(speakerTargetId)}>
+                    <span />{speakerTargetId ? "录制追加样本" : "开始录制"}
+                  </button>
+                )}
+                {speakerTargetId && !speakerRecording && <button className="speaker-cancel" onClick={() => setSpeakerTargetId(null)}>取消</button>}
+              </div>
+            </div>
+
+            <div className="speaker-profile-grid">
+              {speakerProfiles.length === 0 && (
+                <div className="speaker-profile-empty">
+                  <strong>还没有注册声音</strong>
+                  <p>建议每位参会者录制 2 至 3 条不同时间、不同距离的自然语音。</p>
+                </div>
+              )}
+              {speakerProfiles.map((profile, index) => (
+                <article className="speaker-profile-card" key={profile.id} style={{ "--speaker-accent": speakerAccent(`speaker_${index + 1}`) }}>
+                  <div className="speaker-avatar">{profile.name.slice(0, 1)}</div>
+                  <div className="speaker-profile-copy">
+                    <strong>{profile.name}</strong>
+                    <span>{profile.sample_count} 条声音样本</span>
+                    <small>更新于 {new Date(profile.updated_at).toLocaleString()}</small>
+                  </div>
+                  <div className="speaker-samples">
+                    {profile.samples.map((sample, sampleIndex) => (
+                      <audio key={sample.id} controls preload="none" src={`${API_URL}${sample.audio_url}`} title={`样本 ${sampleIndex + 1}`} />
+                    ))}
+                  </div>
+                  <div className="speaker-profile-actions">
+                    <button onClick={() => { setSpeakerTargetId(profile.id); setSpeakerNotice(`为“${profile.name}”追加声音样本。`); }}>追加样本</button>
+                    <button className="danger" onClick={() => deleteSpeakerProfile(profile)}>删除</button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {view === "speeches" && (
+          <section className="speech-workspace">
+            <aside className="speech-history">
+              <div className="speech-history-heading">
+                <div><p className="section-label">SPEECH ARCHIVE</p><h2>演讲稿</h2></div>
+                <button onClick={() => { setSelectedSpeech(null); setSpeechPrompt(""); setSpeechNotice("描述你需要的演讲稿，AI 会自动理解并撰写完整正文。"); }}>新建</button>
+              </div>
+              {speeches.length === 0 && <p className="history-empty">还没有保存的演讲稿</p>}
+              {speeches.map((speech) => (
+                <button
+                  className={`speech-history-item ${selectedSpeech?.id === speech.id ? "active" : ""}`}
+                  key={speech.id}
+                  onClick={() => setSelectedSpeech(speech)}
+                >
+                  <strong>{speech.title}</strong>
+                  <span>{speech.word_count} 字 · 约 {speech.estimated_minutes} 分钟</span>
+                  <small>{new Date(speech.updated_at).toLocaleString()}</small>
+                </button>
+              ))}
+            </aside>
+
+            <div className="speech-studio">
+              {!selectedSpeech ? (
+                <div className="speech-generator">
+                  <p className="hero-kicker">AI SPEECH WRITER</p>
+                  <h2>把想法整理成一篇<br />可以直接朗读的演讲稿</h2>
+                  <p>只需描述你的需求。涉及近期事件、具体数据或内部信息时，请在描述中一并提供相关材料。</p>
+                  <textarea
+                    value={speechPrompt}
+                    placeholder="例如：帮我写一篇关于人工智能发展的五分钟演讲稿，面向公司同事，语气专业但不要太生硬，重点介绍大模型、AI 智能体和多模态技术。"
+                    onChange={(event) => setSpeechPrompt(event.target.value)}
+                  />
+                  <div className="speech-generator-footer">
+                    <span>{speechNotice}</span>
+                    <button disabled={!speechPrompt.trim() || speechBusy} onClick={generateSpeech}>
+                      {speechBusy ? "正在生成..." : "生成演讲稿"}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="speech-toolbar">
+                    <div>
+                      <p className="section-label">AI SPEECH DRAFT</p>
+                      <span>{selectedSpeech.word_count} 字 · 预计朗读 {selectedSpeech.estimated_minutes} 分钟</span>
+                    </div>
+                    <div>
+                      <button disabled={speechBusy} onClick={regenerateSelectedSpeech}>重新生成</button>
+                      <button disabled={speechBusy} onClick={saveSpeech}>保存修改</button>
+                      <button disabled={speechBusy} onClick={exportSelectedSpeech}>导出 Word</button>
+                      <button className="danger" onClick={deleteSelectedSpeech}>删除</button>
+                    </div>
+                  </div>
+                  <div className="speech-paper-wrap">
+                    <article className="speech-paper">
+                      <input
+                        className="speech-title-input"
+                        value={selectedSpeech.title}
+                        onChange={(event) => setSelectedSpeech((current) => ({ ...current, title: event.target.value }))}
+                      />
+                      <textarea
+                        ref={speechContentRef}
+                        className="speech-content-input"
+                        value={selectedSpeech.content}
+                        onChange={(event) => setSelectedSpeech((current) => ({ ...current, content: event.target.value }))}
+                      />
+                    </article>
+                  </div>
+                  <div className="speech-status">{speechNotice}</div>
+                </>
+              )}
+            </div>
           </section>
         )}
       </main>

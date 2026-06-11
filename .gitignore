@@ -27,6 +27,7 @@ backend/models/
 
 # Local editor and Codex caches
 .codex-doc-cache/
+.codegraph/
 .vscode/
 .idea/
 
