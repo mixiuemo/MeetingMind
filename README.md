@@ -1,6 +1,16 @@
 # 会议实时转写系统
 
 第一版本目标是跑通浏览器麦克风采集、WebSocket 音频传输、实时转写展示与文本编辑闭环。
+<img width="3182" height="1646" alt="1" src="https://github.com/user-attachments/assets/55448c07-e0b6-4bf5-b5ea-51cab36e2f31" />
+<img width="3198" height="1868" alt="2" src="https://github.com/user-attachments/assets/c28e69cf-2ac9-4f2c-9cfb-e144cd032e5d" />
+<img width="3190" height="1842" alt="3" src="https://github.com/user-attachments/assets/02e31d42-cd16-44ce-96b7-e149cb52a3ab" />
+<img width="3198" height="1844" alt="4" src="https://github.com/user-attachments/assets/cdd80885-e0ee-47b5-ba17-4bd50f461971" />
+<img width="3194" height="1848" alt="5" src="https://github.com/user-attachments/assets/1867375a-fbfc-4820-b1bb-2ae027d873b8" />
+<img width="3196" height="1864" alt="6" src="https://github.com/user-attachments/assets/53600d3c-7211-4d98-a86b-bf75e9658a96" />
+<img width="3198" height="1844" alt="7" src="https://github.com/user-attachments/assets/4bb04c1a-ca33-4baf-bab1-4cbcc9431a05" />
+<img width="3194" height="1860" alt="8" src="https://github.com/user-attachments/assets/4d848be0-939e-41e6-a969-bcca1b3afd0c" />
+<img width="3188" height="1844" alt="9" src="https://github.com/user-attachments/assets/a8414ea4-5667-4f14-b349-8b849a5d13d1" />
+<img width="3192" height="1848" alt="10" src="https://github.com/user-attachments/assets/f50438de-659d-4d96-a7f6-85bdcb2d9513" />
 
 ## 项目结构
 
